@@ -1,0 +1,27 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Streamlit cache
+.streamlit/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Editor files
+.vscode/
+.idea/
+
+# Outputs (your app creates these)
+outputs/
+*.log
+
+# OS junk
+.DS_Store
+Thumbs.db
