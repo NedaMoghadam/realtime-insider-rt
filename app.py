@@ -17,14 +17,16 @@ except Exception:
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # -------------------------------------------------------------------
-# Streamlit page config
+# Streamlit page config + main header (PERSONALIZED)
 # -------------------------------------------------------------------
 st.set_page_config(
-    page_title="Real-Time Insider Threat Detection",
+    page_title="Real-Time Insider Threat Detection – Neda B. Moghadam",
     layout="wide",
 )
 
 st.title("Real-Time Insider Threat Detection with TinyLlama + Early Exit")
+st.markdown("**Developed by: Neda B. Moghadam (Polytechnique Montréal)**")
+st.markdown("---")
 
 st.markdown(
     """
@@ -34,12 +36,19 @@ and watch anomalies appear **in real time** as sliding windows are processed.
 )
 
 # -------------------------------------------------------------------
-# Sidebar controls
+# Sidebar controls (with About box)
 # -------------------------------------------------------------------
 st.sidebar.header("Settings")
 
-test_mode = st.sidebar.checkbox("Test mode (first 1000 rows only)", value=True)
+# Small about section so everyone sees the owner
+st.sidebar.title("About this app")
+st.sidebar.info(
+    "Real-time insider threat detection demo using TinyLlama and early-exit, "
+    "developed by **Neda B. Moghadam**.\n\n"
+    "Upload your own log CSV file and run the full pipeline in real time."
+)
 
+test_mode = st.sidebar.checkbox("Test mode (first 1000 rows only)", value=True)
 window_min = st.sidebar.slider("Window size (minutes)", 10, 180, 60, 10)
 slide_min = st.sidebar.slider("Slide size (minutes)", 1, 60, 10, 1)
 
@@ -166,3 +175,13 @@ if uploaded_file and run_button:
                 os.unlink(tmp_path)
             except:
                 pass
+
+# -------------------------------------------------------------------
+# Footer with  name
+# -------------------------------------------------------------------
+st.markdown("---")
+st.markdown(
+    "© 2025 **Neda B. Moghadam** · Real-Time Insider Threat Detection Demo "
+    "· For research and educational use."
+)
+
