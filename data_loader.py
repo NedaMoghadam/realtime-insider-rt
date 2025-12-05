@@ -5,11 +5,12 @@ Handles loading and initial processing of CSV log files.
 
 import pandas as pd
 from pathlib import Path
-from typing import Optional, List
+from typing import Optional, List, Dict
 
 from logger import get_logger
 from exceptions import DataLoadError
 from validator import DataValidator
+import config
 
 logger = get_logger(__name__)
 
@@ -21,23 +22,28 @@ class DataLoader:
 
     def __init__(
         self,
-        required_columns: List[str] = None,
-        optional_columns: List[str] = None,
+        required_columns: Optional[List[str]] = None,
+        optional_columns: Optional[List[str]] = None,
         date_column: str = "date",
         date_format: Optional[str] = None,
     ):
-        self.required_columns = required_columns or ["date", "user", "pc", "activity"]
-        self.optional_columns = optional_columns or ["role"]
+        """
+        Initialize data loader.
+        """
+        # Use config defaults if not provided
+        self.required_columns = required_columns or config.REQUIRED_COLUMNS
+        self.optional_columns = optional_columns or config.OPTIONAL_COLUMNS
         self.date_column = date_column
         self.date_format = date_format
 
-        # Attach validator
         self.validator = DataValidator(
             required_columns=self.required_columns,
-            date_column=self.date_column,
+            date_column=date_column,
         )
 
-        logger.info(f"DataLoader initialized with required columns: {self.required_columns}")
+        logger.info(
+            f"DataLoader initialized with required columns: {self.required_columns}"
+        )
 
     def load(
         self,
@@ -46,14 +52,17 @@ class DataLoader:
         encoding: str = "utf-8",
         low_memory: bool = False,
     ) -> pd.DataFrame:
-        """Load a CSV file into a DataFrame."""
-
+        """
+        Load data from CSV file.
+        """
         filepath = Path(filepath)
 
         if not filepath.exists():
             raise DataLoadError(f"File not found: {filepath}")
 
-        logger.info(f"Loading data from: {filepath}")
+        logger.info(f"Loading data from {filepath}")
+        if nrows:
+            logger.info(f"Loading first {nrows} rows only")
 
         try:
             df = pd.read_csv(
@@ -63,61 +72,109 @@ class DataLoader:
                 low_memory=low_memory,
             )
 
-            logger.info(f"Loaded {len(df)} rows.")
+            logger.info(f"Loaded {len(df)} rows, {len(df.columns)} columns")
 
-            # Validate required columns
+            # Validate
             self.validator.validate(df)
 
-            # Clean and enhance
+            # Process
             df = self._initial_processing(df)
+
+            logger.info(f"Data loading complete: {len(df)} valid rows")
 
             return df
 
         except Exception as e:
-            raise DataLoadError(f"Failed to load CSV: {e}")
+            logger.error(f"Failed to load data: {e}")
+            raise DataLoadError(f"Could not load {filepath}: {e}")
 
     def _initial_processing(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Initial cleaning pipeline."""
+        """
+        Perform initial processing on loaded data.
+        """
+        logger.debug("Performing initial processing...")
 
-        # Parse date column
+        # Convert date column
         df = self._parse_dates(df)
 
-        # Add missing optional columns
+        # ---------- NEW: handle aggregated daily data ----------
+        # If 'pc' or 'activity' are missing, create them from other columns
+        if ("pc" not in df.columns) or ("activity" not in df.columns):
+            logger.info(
+                "No 'pc'/'activity' columns found. "
+                "Assuming aggregated daily user data and auto-building them."
+            )
+
+            # Synthetic PC if not present
+            if "pc" not in df.columns:
+                df["pc"] = "AGG_PC"
+
+            # Build a daily activity summary if missing
+            if "activity" not in df.columns:
+                def build_activity(row):
+                    # ignore these when building text
+                    ignore = {self.date_column, "user", "pc", "role"}
+                    parts = []
+                    for col in row.index:
+                        if col in ignore:
+                            continue
+                        value = row[col]
+                        if pd.isna(value):
+                            continue
+                        parts.append(f"{col}={value}")
+                    # Example: "emails=5 | downloads=2 | risky_logons=1"
+                    return " | ".join(parts) if parts else "DailySummary"
+
+                df["activity"] = df.apply(build_activity, axis=1)
+        # ---------- end NEW block -------------------------------
+
+        # Add optional columns if missing
         for col in self.optional_columns:
             if col not in df.columns:
                 df[col] = "unknown"
-                logger.info(f"Added missing optional column: {col}")
+                logger.debug(f"Added missing optional column: {col}")
 
-        # Sort chronologically
+        # Sort by date
         df = df.sort_values(self.date_column).reset_index(drop=True)
 
-        # Remove duplicate rows
-        before = len(df)
+        # Remove duplicates
+        original_len = len(df)
         df = df.drop_duplicates()
-        after = len(df)
-
-        if after < before:
-            logger.info(f"Removed {before - after} duplicate rows.")
+        if len(df) < original_len:
+            logger.warning(f"Removed {original_len - len(df)} duplicate rows")
 
         return df
 
     def _parse_dates(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Parse timestamps safely."""
+        """
+        Parse date column.
+        """
+        logger.debug(f"Parsing date column: {self.date_column}")
 
         try:
-            df[self.date_column] = pd.to_datetime(
-                df[self.date_column],
-                format=self.date_format,
-                errors="coerce",
-            )
+            if self.date_format:
+                df[self.date_column] = pd.to_datetime(
+                    df[self.date_column],
+                    format=self.date_format,
+                    errors="coerce",
+                )
+            else:
+                df[self.date_column] = pd.to_datetime(
+                    df[self.date_column],
+                    errors="coerce",
+                )
 
-            # Remove invalid dates
-            invalid = df[self.date_column].isna().sum()
-            if invalid > 0:
-                logger.info(f"Removed {invalid} rows with invalid timestamps.")
+            invalid_count = df[self.date_column].isna().sum()
+            if invalid_count > 0:
+                logger.warning(
+                    f"Found {invalid_count} invalid dates, dropping those rows"
+                )
                 df = df.dropna(subset=[self.date_column])
 
+            logger.debug("Date parsing complete")
             return df
 
         except Exception as e:
-            raise DataLoadError(f"Date parsing failed: {e}")
+            logger.error(f"Date parsing failed: {e}")
+            raise DataLoadError(f"Could not parse dates: {e}")
+

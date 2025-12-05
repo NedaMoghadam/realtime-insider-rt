@@ -1,4 +1,4 @@
-Developed by: Neda B. Moghadam
+
 
 
 import os
