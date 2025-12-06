@@ -1,6 +1,4 @@
 
-
-
 import os
 import tempfile
 import pandas as pd
@@ -15,6 +13,7 @@ try:
     from config import OUTPUT_BASE_DIR
     OUTPUT_DIR = OUTPUT_BASE_DIR
 except Exception:
+    # Fallback: create "outputs" next to app.py
     OUTPUT_DIR = os.path.join(os.getcwd(), "outputs")
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -76,30 +75,48 @@ if "live_chart_data" not in st.session_state:
 # Callback used by the pipeline for each time window
 # -------------------------------------------------------------------
 def live_callback(slot_idx, total_slots, info):
+    """
+    Called from pipeline_rt for every processed time window.
 
+    It updates:
+    - progress bar
+    - textual log
+    - live charts (events vs anomalies, anomaly rate)
+    """
+
+    # Be robust to different metric names: "events" or "n_events"
+    events = info.get("events", info.get("n_events", 0)) or 0
+    anomalies = info.get("anomalies", info.get("n_anomalies", 0)) or 0
+
+    # Ensure they are ints
+    events = int(events)
+    anomalies = int(anomalies)
+
+    # Progress bar
     progress = (slot_idx + 1) / max(total_slots, 1)
     progress_bar.progress(progress)
 
+    # Status line
     status_text.info(
         f"Processing window {slot_idx+1}/{total_slots} | "
-        f"{info['timestamp']} → {info['events']} events, "
-        f"{info['anomalies']} anomalies"
+        f"{info['timestamp']} → {events} events, {anomalies} anomalies"
     )
 
+    # Text log
     with log_container:
         st.write(
             f"Slot {slot_idx+1:3d} | {info['timestamp']} | "
-            f"{info['events']:4d} events → **{info['anomalies']:2d} anomalies**"
+            f"{events:4d} events → **{anomalies:2d} anomalies**"
         )
 
     # Live chart data update
-    anomaly_rate = info["anomalies"] / info["events"] if info["events"] > 0 else 0.0
+    anomaly_rate = anomalies / events if events > 0 else 0.0
 
     st.session_state["live_chart_data"].append(
         {
             "timestamp": info["timestamp"],
-            "events": info["events"],
-            "anomalies": info["anomalies"],
+            "events": events,
+            "anomalies": anomalies,
             "anomaly_rate": anomaly_rate,
         }
     )
@@ -129,8 +146,10 @@ def live_callback(slot_idx, total_slots, info):
 # -------------------------------------------------------------------
 if uploaded_file and run_button:
 
+    # Reset live charts for a fresh run
     st.session_state["live_chart_data"] = []
 
+    # Save uploaded file to a temporary location
     with tempfile.NamedTemporaryFile(delete=False, suffix=".csv") as tmp_file:
         tmp_file.write(uploaded_file.getvalue())
         tmp_path = tmp_file.name
@@ -158,7 +177,10 @@ if uploaded_file and run_button:
                     col for col in ["timestamp", "user", "pc", "activity", "score"]
                     if col in anomalies_df.columns
                 ]
-                st.dataframe(anomalies_df[display_cols].head(50), use_container_width=True)
+                st.dataframe(
+                    anomalies_df[display_cols].head(50),
+                    use_container_width=True,
+                )
             else:
                 st.info("No anomalies found.")
 
@@ -167,7 +189,11 @@ if uploaded_file and run_button:
 
             plot_path = os.path.join(output_folder, "score_distribution.png")
             if os.path.exists(plot_path):
-                st.image(plot_path, caption="Anomaly Score Distribution", use_column_width=True)
+                st.image(
+                    plot_path,
+                    caption="Anomaly Score Distribution",
+                    use_column_width=True,
+                )
 
     except Exception as e:
         st.error(f"Error during analysis: {e}")
@@ -176,15 +202,15 @@ if uploaded_file and run_button:
         if os.path.exists(tmp_path):
             try:
                 os.unlink(tmp_path)
-            except:
+            except Exception:
+                # If deletion fails, just ignore
                 pass
 
 # -------------------------------------------------------------------
-# Footer with  name
+# Footer with name
 # -------------------------------------------------------------------
 st.markdown("---")
 st.markdown(
     "© 2025 **Neda B. Moghadam** · Real-Time Insider Threat Detection Demo "
     "· For research and educational use."
 )
-
