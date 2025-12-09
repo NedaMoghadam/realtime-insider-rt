@@ -1,180 +1,205 @@
 """
-Data Loading Module
-Handles loading and initial processing of CSV log files.
+Data loading utilities for the real-time insider threat pipeline.
+
+This module is deliberately conservative and robust:
+- Uses pandas.read_csv with engine="c" when possible (fast, safe)
+- Falls back to the Python engine without low_memory when needed
+- Validates required columns
+- Adds any missing optional columns as "unknown"
+- Parses and sorts the timestamp column
 """
 
+from __future__ import annotations
+
+import os
+from typing import List, Optional
+
 import pandas as pd
-from pathlib import Path
-from typing import Optional, List, Dict
 
 from logger import get_logger
-from exceptions import DataLoadError
-from validator import DataValidator
-import config
+from exceptions import PipelineError
 
 logger = get_logger(__name__)
 
 
 class DataLoader:
     """
-    Loads and performs initial processing of log data.
+    Simple CSV loader with schema validation and safe pandas settings.
+
+    Parameters
+    ----------
+    required_columns : list of str
+        Columns that MUST exist in the CSV (after lower-casing names).
+    optional_columns : list of str
+        Columns that are nice to have; if missing, they are created with "unknown".
+    date_column : str
+        Name of the timestamp column (after lower-casing).
+    date_format : str or None
+        Optional explicit datetime format; if None, pandas auto-detects.
     """
 
     def __init__(
         self,
-        required_columns: Optional[List[str]] = None,
+        required_columns: List[str],
         optional_columns: Optional[List[str]] = None,
         date_column: str = "date",
         date_format: Optional[str] = None,
-    ):
-        """
-        Initialize data loader.
-        """
-        # Use config defaults if not provided
-        self.required_columns = required_columns or config.REQUIRED_COLUMNS
-        self.optional_columns = optional_columns or config.OPTIONAL_COLUMNS
-        self.date_column = date_column
+    ) -> None:
+        self.required_columns = [c.lower() for c in required_columns]
+        self.optional_columns = [c.lower() for c in (optional_columns or [])]
+        self.date_column = date_column.lower()
         self.date_format = date_format
 
-        self.validator = DataValidator(
-            required_columns=self.required_columns,
-            date_column=date_column,
-        )
-
         logger.info(
-            f"DataLoader initialized with required columns: {self.required_columns}"
+            "DataLoader initialized | required=%s | optional=%s | date_column=%s",
+            self.required_columns,
+            self.optional_columns,
+            self.date_column,
         )
 
-    def load(
-        self,
-        filepath: str,
-        nrows: Optional[int] = None,
-        encoding: str = "utf-8",
-        low_memory: bool = False,
-    ) -> pd.DataFrame:
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+    def load(self, file_path: str, nrows: Optional[int] = None) -> pd.DataFrame:
         """
-        Load data from CSV file.
+        Load and validate a single CSV file.
+
+        Parameters
+        ----------
+        file_path : str
+            Path to the CSV file.
+        nrows : int or None
+            If not None, only the first nrows rows are read (used for test_mode).
+
+        Returns
+        -------
+        pandas.DataFrame
         """
-        filepath = Path(filepath)
+        if not os.path.exists(file_path):
+            raise PipelineError(f"Input file does not exist: {file_path}")
 
-        if not filepath.exists():
-            raise DataLoadError(f"File not found: {filepath}")
+        logger.info("Loading CSV: %s (nrows=%s)", file_path, nrows)
 
-        logger.info(f"Loading data from {filepath}")
-        if nrows:
-            logger.info(f"Loading first {nrows} rows only")
+        df = self._read_csv_safe(file_path, nrows=nrows)
 
+        # Normalize column names
+        df.columns = [str(c).strip().lower() for c in df.columns]
+
+        # Validate columns and add missing optional ones
+        df = self._validate_and_fix_columns(df)
+
+        # Parse timestamp column
+        df = self._parse_and_sort_dates(df)
+
+        logger.info("Loaded %d rows after preprocessing", len(df))
+        return df
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+    def _read_csv_safe(self, file_path: str, nrows: Optional[int]) -> pd.DataFrame:
+        """
+        Read a CSV using pandas with safe options.
+
+        Strategy:
+        - Try fast C engine with low_memory=False, on_bad_lines="skip"
+        - If that fails (older pandas / weird file), retry with fewer options
+        - As a last resort, use engine="python" WITHOUT low_memory
+        """
+        # First attempt: C engine, low_memory=False
+        try:
+            logger.info("Reading CSV with engine='c', low_memory=False")
+            df = pd.read_csv(
+                file_path,
+                nrows=nrows,
+                engine="c",
+                low_memory=False,
+                on_bad_lines="skip",  # requires pandas >= 1.3
+            )
+            return df
+        except TypeError:
+            # on_bad_lines might not be supported in older pandas
+            logger.warning(
+                "on_bad_lines not supported in this pandas version; retrying without it"
+            )
+            try:
+                df = pd.read_csv(
+                    file_path,
+                    nrows=nrows,
+                    engine="c",
+                    low_memory=False,
+                )
+                return df
+            except Exception as e:
+                logger.warning("C engine failed: %s; falling back to python engine", e)
+
+        # Final fallback: Python engine, NO low_memory
+        logger.info("Reading CSV with engine='python' (fallback)")
         try:
             df = pd.read_csv(
-                filepath,
+                file_path,
                 nrows=nrows,
-                encoding=encoding,
-                low_memory=low_memory,
+                engine="python",
+                # DO NOT pass low_memory here – this is what caused the error.
             )
-
-            logger.info(f"Loaded {len(df)} rows, {len(df.columns)} columns")
-
-            # Validate
-            self.validator.validate(df)
-
-            # Process
-            df = self._initial_processing(df)
-
-            logger.info(f"Data loading complete: {len(df)} valid rows")
-
             return df
-
         except Exception as e:
-            logger.error(f"Failed to load data: {e}")
-            raise DataLoadError(f"Could not load {filepath}: {e}")
+            logger.error("Failed to read CSV even with python engine: %s", e)
+            raise PipelineError(f"Could not read CSV: {e}")
 
-    def _initial_processing(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Perform initial processing on loaded data.
-        """
-        logger.debug("Performing initial processing...")
+    def _validate_and_fix_columns(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Ensure required columns exist and optional ones are present."""
+        missing_required = [
+            col for col in self.required_columns if col not in df.columns
+        ]
+        if missing_required:
+            msg = f"Missing required columns: {missing_required}"
+            logger.error(msg)
+            raise PipelineError(msg)
 
-        # Convert date column
-        df = self._parse_dates(df)
-
-        # ---------- NEW: handle aggregated daily data ----------
-        # If 'pc' or 'activity' are missing, create them from other columns
-        if ("pc" not in df.columns) or ("activity" not in df.columns):
-            logger.info(
-                "No 'pc'/'activity' columns found. "
-                "Assuming aggregated daily user data and auto-building them."
-            )
-
-            # Synthetic PC if not present
-            if "pc" not in df.columns:
-                df["pc"] = "AGG_PC"
-
-            # Build a daily activity summary if missing
-            if "activity" not in df.columns:
-                def build_activity(row):
-                    # ignore these when building text
-                    ignore = {self.date_column, "user", "pc", "role"}
-                    parts = []
-                    for col in row.index:
-                        if col in ignore:
-                            continue
-                        value = row[col]
-                        if pd.isna(value):
-                            continue
-                        parts.append(f"{col}={value}")
-                    # Example: "emails=5 | downloads=2 | risky_logons=1"
-                    return " | ".join(parts) if parts else "DailySummary"
-
-                df["activity"] = df.apply(build_activity, axis=1)
-        # ---------- end NEW block -------------------------------
-
-        # Add optional columns if missing
+        # Add missing optional columns
         for col in self.optional_columns:
             if col not in df.columns:
+                logger.warning("Optional column '%s' missing; filling with 'unknown'", col)
                 df[col] = "unknown"
-                logger.debug(f"Added missing optional column: {col}")
-
-        # Sort by date
-        df = df.sort_values(self.date_column).reset_index(drop=True)
-
-        # Remove duplicates
-        original_len = len(df)
-        df = df.drop_duplicates()
-        if len(df) < original_len:
-            logger.warning(f"Removed {original_len - len(df)} duplicate rows")
 
         return df
 
-    def _parse_dates(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Parse date column.
-        """
-        logger.debug(f"Parsing date column: {self.date_column}")
+    def _parse_and_sort_dates(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Parse the date column and sort by it."""
+        if self.date_column not in df.columns:
+            msg = f"Date column '{self.date_column}' not found in CSV"
+            logger.error(msg)
+            raise PipelineError(msg)
 
-        try:
-            if self.date_format:
-                df[self.date_column] = pd.to_datetime(
-                    df[self.date_column],
-                    format=self.date_format,
-                    errors="coerce",
-                )
-            else:
-                df[self.date_column] = pd.to_datetime(
-                    df[self.date_column],
-                    errors="coerce",
-                )
+        logger.info(
+            "Parsing datetime column '%s' (format=%s)",
+            self.date_column,
+            self.date_format,
+        )
 
-            invalid_count = df[self.date_column].isna().sum()
-            if invalid_count > 0:
-                logger.warning(
-                    f"Found {invalid_count} invalid dates, dropping those rows"
-                )
-                df = df.dropna(subset=[self.date_column])
+        if self.date_format:
+            df[self.date_column] = pd.to_datetime(
+                df[self.date_column],
+                format=self.date_format,
+                errors="coerce",
+            )
+        else:
+            df[self.date_column] = pd.to_datetime(
+                df[self.date_column],
+                errors="coerce",
+                infer_datetime_format=True,
+            )
 
-            logger.debug("Date parsing complete")
-            return df
+        # Drop rows where the date could not be parsed
+        before = len(df)
+        df = df.dropna(subset=[self.date_column])
+        after = len(df)
 
-        except Exception as e:
-            logger.error(f"Date parsing failed: {e}")
-            raise DataLoadError(f"Could not parse dates: {e}")
+        if after < before:
+            logger.warning(
+                "Dropped %d rows with unparsable dates", before - after
+            )
 
+        df = df.sort_values(self.date_column).reset_index(drop=True)
+        return df

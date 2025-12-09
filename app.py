@@ -1,10 +1,12 @@
-
 import os
 import tempfile
+from typing import List, Tuple
+
 import pandas as pd
 import streamlit as st
 
-from pipeline_rt import run_realtime_detection  # uses your existing pipeline_rt.py
+from pipeline_rt import run_realtime_detection  # your existing pipeline
+
 
 # -------------------------------------------------------------------
 # Output directory (use your existing base folder)
@@ -13,13 +15,13 @@ try:
     from config import OUTPUT_BASE_DIR
     OUTPUT_DIR = OUTPUT_BASE_DIR
 except Exception:
-    # Fallback: create "outputs" next to app.py
     OUTPUT_DIR = os.path.join(os.getcwd(), "outputs")
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
+
 # -------------------------------------------------------------------
-# Streamlit page config + main header (PERSONALIZED)
+# Streamlit page config + main header
 # -------------------------------------------------------------------
 st.set_page_config(
     page_title="Real-Time Insider Threat Detection – Neda B. Moghadam",
@@ -32,8 +34,9 @@ st.markdown("---")
 
 st.markdown(
     """
-Upload a **log CSV file** (CERT, LANL, or your own enterprise logs)  
-and watch anomalies appear **in real time** as sliding windows are processed.
+Upload one or **more** log CSV file(s) (CERT, LANL, or your own enterprise logs).  
+They will be concatenated, converted to daily user activity,  
+and anomalies will appear **in real time** as sliding windows are processed.
 """
 )
 
@@ -42,22 +45,62 @@ and watch anomalies appear **in real time** as sliding windows are processed.
 # -------------------------------------------------------------------
 st.sidebar.header("Settings")
 
-# Small about section so everyone sees the owner
 st.sidebar.title("About this app")
 st.sidebar.info(
     "Real-time insider threat detection demo using TinyLlama and early-exit, "
     "developed by **Neda B. Moghadam**.\n\n"
-    "Upload your own log CSV file and run the full pipeline in real time."
+    "Upload your own log CSV file(s) and run the full pipeline in real time."
 )
 
-test_mode = st.sidebar.checkbox("Test mode (first 1000 rows only)", value=True)
+test_mode = st.sidebar.checkbox("Test mode (first 1000 rows per file only)", value=True)
 window_min = st.sidebar.slider("Window size (minutes)", 10, 180, 60, 10)
 slide_min = st.sidebar.slider("Slide size (minutes)", 1, 60, 10, 1)
 
 # -------------------------------------------------------------------
+# Helpers
+# -------------------------------------------------------------------
+def merge_files_for_analysis(
+    uploaded_files: List[st.runtime.uploaded_file_manager.UploadedFile],
+    test_mode: bool = True,
+) -> Tuple[str, int]:
+    """
+    Read one or more uploaded CSVs into a single temporary CSV file.
+
+    Returns:
+        merged_path: path to temporary merged file
+        total_rows:  total number of rows used
+    """
+    dfs = []
+    total_rows = 0
+
+    for f in uploaded_files:
+        # f is a Streamlit UploadedFile
+        df = pd.read_csv(f, low_memory=False)
+
+        if test_mode:
+            df = df.head(1000)
+
+        dfs.append(df)
+        total_rows += len(df)
+
+    if not dfs:
+        raise ValueError("No data in uploaded files.")
+
+    merged_df = pd.concat(dfs, ignore_index=True)
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".csv") as tmp:
+        merged_df.to_csv(tmp.name, index=False)
+        merged_path = tmp.name
+
+    return merged_path, total_rows
+
+
+# -------------------------------------------------------------------
 # Main layout placeholders
 # -------------------------------------------------------------------
-uploaded_file = st.file_uploader("📁 Upload your log CSV file", type=["csv"])
+uploaded_files = st.file_uploader(
+    "📁 Upload your log CSV file(s)", type=["csv"], accept_multiple_files=True
+)
 run_button = st.button("🚀 Start Real-Time Detection", type="primary")
 
 status_text = st.empty()
@@ -79,11 +122,10 @@ def live_callback(slot_idx, total_slots, info):
     Called from pipeline_rt for every processed time window.
 
     It updates:
-    - progress bar
-    - textual log
-    - live charts (events vs anomalies, anomaly rate)
+      - progress bar
+      - textual log
+      - live charts (events vs anomalies, anomaly rate)
     """
-
     # Be robust to different metric names: "events" or "n_events"
     events = info.get("events", info.get("n_events", 0)) or 0
     anomalies = info.get("anomalies", info.get("n_anomalies", 0)) or 0
@@ -144,21 +186,22 @@ def live_callback(slot_idx, total_slots, info):
 # -------------------------------------------------------------------
 # Main run
 # -------------------------------------------------------------------
-if uploaded_file and run_button:
-
+if uploaded_files and run_button:
     # Reset live charts for a fresh run
     st.session_state["live_chart_data"] = []
 
-    # Save uploaded file to a temporary location
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".csv") as tmp_file:
-        tmp_file.write(uploaded_file.getvalue())
-        tmp_path = tmp_file.name
+    # 1) Merge all uploaded CSVs into a single temporary file
+    merged_path, total_rows = merge_files_for_analysis(uploaded_files, test_mode=test_mode)
 
-    st.success("File uploaded — starting real-time analysis...")
+    st.success(
+        f"{len(uploaded_files)} file(s) merged → {total_rows:,} rows. "
+        "Starting real-time analysis..."
+    )
 
     try:
+        # 2) Call your pipeline with the **correct signature**
         anomalies_df, output_folder = run_realtime_detection(
-            file_path=tmp_path,
+            file_path=merged_path,
             output_base_dir=OUTPUT_DIR,
             test_mode=test_mode,
             window_time=window_min,
@@ -173,14 +216,40 @@ if uploaded_file and run_button:
             st.subheader("🔎 Top Detected Anomalies")
 
             if anomalies_df is not None and not anomalies_df.empty:
+                # Basic table
                 display_cols = [
-                    col for col in ["timestamp", "user", "pc", "activity", "score"]
+                    col
+                    for col in ["timestamp", "user", "pc", "activity", "score"]
                     if col in anomalies_df.columns
                 ]
                 st.dataframe(
-                    anomalies_df[display_cols].head(50),
+                    anomalies_df[display_cols].head(100),
                     use_container_width=True,
                 )
+
+                # ---------------- Extra visualisations ----------------
+                # 1) Anomalies per user
+                if "user" in anomalies_df.columns:
+                    st.subheader("👤 Anomalies per User (top 20)")
+                    user_counts = anomalies_df["user"].value_counts().head(20)
+                    st.bar_chart(user_counts)
+
+                # 2) Score distribution for anomalies
+                if "score" in anomalies_df.columns:
+                    st.subheader("📈 Anomaly Score Distribution")
+                    st.histogram(anomalies_df["score"])
+
+                # 3) Anomalies over time (if timestamp available)
+                if "timestamp" in anomalies_df.columns:
+                    st.subheader("⏱ Anomalies Over Time")
+                    time_counts = (
+                        anomalies_df.set_index("timestamp")
+                        .resample("1H")
+                        .size()
+                        .rename("n_anomalies")
+                    )
+                    st.line_chart(time_counts)
+
             else:
                 st.info("No anomalies found.")
 
@@ -191,7 +260,7 @@ if uploaded_file and run_button:
             if os.path.exists(plot_path):
                 st.image(
                     plot_path,
-                    caption="Anomaly Score Distribution",
+                    caption="Anomaly Score Distribution (pipeline plot)",
                     use_column_width=True,
                 )
 
@@ -199,11 +268,10 @@ if uploaded_file and run_button:
         st.error(f"Error during analysis: {e}")
 
     finally:
-        if os.path.exists(tmp_path):
+        if os.path.exists(merged_path):
             try:
-                os.unlink(tmp_path)
+                os.unlink(merged_path)
             except Exception:
-                # If deletion fails, just ignore
                 pass
 
 # -------------------------------------------------------------------

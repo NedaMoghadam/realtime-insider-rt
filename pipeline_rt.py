@@ -1,12 +1,18 @@
 """
-Real-Time Detection Pipeline — Final Stable Version (A + B + C + Safe Index Fix)
-Works with:
+Real-Time Detection Pipeline
+
+Connects:
 - config.py
 - logger.py
 - exceptions.py
+- validator.py
 - data_loader.py
 - tinyllama_model.py
 - anomaly_detector.py
+
+and exposes:
+- class RealtimePipeline
+- function run_realtime_detection(...)  ← used by Streamlit app
 """
 
 import os
@@ -17,13 +23,11 @@ from typing import Callable, Optional, Dict, List
 import numpy as np
 import pandas as pd
 from sklearn.preprocessing import LabelEncoder
-
-import matplotlib
-matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 import config
 from logger import get_logger
+from exceptions import PipelineError
 from data_loader import DataLoader
 from tinyllama_model import TinyLlamaModel
 from anomaly_detector import AnomalyDetector
@@ -31,44 +35,54 @@ from anomaly_detector import AnomalyDetector
 logger = get_logger(__name__)
 
 
-# ----------------------------------------------------------------------
-# Convert row → TinyLlama text
-# ----------------------------------------------------------------------
 def render_event(row: pd.Series) -> str:
-    ts = row["date"].strftime("%Y-%m-%d %H:%M")
+    """Turn one log row into a text sentence for TinyLlama."""
+    # Make sure we don't crash if fields are missing
+    ts_val = row.get("date")
+    if isinstance(ts_val, pd.Timestamp):
+        ts = ts_val.strftime("%Y-%m-%d %H:%M")
+    else:
+        ts = str(ts_val)
+
+    user = row.get("user", "unknown")
+    role = row.get("role", "unknown")
+    pc = row.get("pc", "unknown")
+    activity = row.get("activity", "unknown")
+    hour = row.get("hour", -1)
+    dow = row.get("day_of_week", -1)
+
     return (
-        f"[{ts}] user={row['user']} role={row['role']} pc={row['pc']} "
-        f"activity={row['activity']} hour={row['hour']} dow={row['day_of_week']}"
+        f"[{ts}] user={user} role={role} pc={pc} "
+        f"activity={activity} hour={hour} dow={dow}"
     )
 
 
-# ======================================================================
-# REAL-TIME PIPELINE (BEST VERSION)
-# ======================================================================
 class RealtimePipeline:
     """
-    Combined improvements:
-    - Robust preprocessing
-    - Deterministic namespaced user/pc IDs
-    - EMA user embeddings
-    - Rolling baseline IsolationForest
-    - Safe indexing (no out-of-bounds crash)
-    - Expanded feature vector
+    Simple real-time anomaly detection pipeline.
+
+    Steps per time window:
+    1) Build event texts
+    2) TinyLlama → embeddings (last layer)
+    3) Aggregate user/node embeddings
+    4) Build edge features [user_emb, pc_emb, activity_encoded]
+    5) IsolationForest → anomaly scores + labels
     """
 
     def __init__(self):
         logger.info("=" * 70)
-        logger.info("Initializing Real-Time Combined Pipeline")
+        logger.info("Initializing Real-Time Pipeline")
         logger.info("=" * 70)
 
+        # 1) Data loader
         self.loader = DataLoader(
             required_columns=config.REQUIRED_COLUMNS,
             optional_columns=config.OPTIONAL_COLUMNS,
-            date_column="date",
+            date_column=config.DATE_COLUMN,
             date_format=config.DATE_FORMAT,
         )
 
-        # TinyLlama model
+        # 2) TinyLlama model
         self.model = TinyLlamaModel(
             model_id=config.MODEL_ID,
             cache_dir=None,
@@ -76,22 +90,18 @@ class RealtimePipeline:
             max_length=config.MAX_SEQUENCE_LENGTH,
         )
 
-        # Rolling baseline anomaly detector
+        # 3) Anomaly detector
         self.detector = AnomalyDetector(
-            contamination=config.CONTAMINATION_FACTOR,
-            random_state=42,
+            contamination=config.CONTAMINATION
         )
-
-        # Rolling baseline memory
-        self.baseline_features: List[np.ndarray] = []
 
         self.hidden_size = self.model.hidden_size
 
-        logger.info("Pipeline initialized.")
+        logger.info("Pipeline initialization complete")
         logger.info("=" * 70)
 
     # ------------------------------------------------------------------
-    # RUN PIPELINE
+    # PUBLIC ENTRY POINT
     # ------------------------------------------------------------------
     def run(
         self,
@@ -102,222 +112,318 @@ class RealtimePipeline:
         slide_time: int = 10,
         callback: Optional[Callable[[int, int, Dict], None]] = None,
     ) -> Dict:
+        """
+        Run the pipeline on one CSV file.
 
+        Args:
+            input_file: path to CSV
+            output_dir: folder to save results
+            test_mode: if True, only first N rows (from config.TEST_MODE_ROWS)
+            window_time: window size in minutes
+            slide_time: slide size in minutes
+            callback: optional function(slot_idx, total_slots, info_dict)
+        """
         os.makedirs(output_dir, exist_ok=True)
+        logger.info(f"Output directory: {output_dir}")
 
+        # 1) Load data
         nrows = config.TEST_MODE_ROWS if test_mode else None
+        logger.info(f"Loading data from {input_file} (test_mode={test_mode}, nrows={nrows})")
         df = self.loader.load(input_file, nrows=nrows)
 
+        if df.empty:
+            raise PipelineError("Loaded dataframe is empty – nothing to process.")
+
+        # 2) Preprocess (add features, ids, synthesize activity if missing)
         df = self._preprocess(df)
 
+        # 3) Sliding windows
         results = self._process_windows(
-            df,
+            df=df,
             window_time=window_time,
             slide_time=slide_time,
             callback=callback,
         )
 
+        # 4) Save to disk
         self._save_results(results, output_dir)
 
         return results
 
     # ------------------------------------------------------------------
-    # STEP 1 — PREPROCESSING
+    # INTERNAL HELPERS
     # ------------------------------------------------------------------
     def _preprocess(self, df: pd.DataFrame) -> pd.DataFrame:
-        logger.info("Preprocessing...")
+        """
+        Add time features, ensure an 'activity' column exists,
+        encode categories, and map nodes to ids.
+        """
+        logger.info("Preprocessing data...")
 
         df = df.copy()
+
+        # --- 1) ensure datetime + basic time features ---
+        if not np.issubdtype(df[config.DATE_COLUMN].dtype, np.datetime64):
+            df[config.DATE_COLUMN] = pd.to_datetime(
+                df[config.DATE_COLUMN], errors="coerce"
+            )
+
+        df["date"] = df[config.DATE_COLUMN]  # create standard name
         df["hour"] = df["date"].dt.hour
         df["day_of_week"] = df["date"].dt.dayofweek
 
-        # Fill NaNs
-        df["activity"] = df["activity"].fillna("UNKNOWN_ACTIVITY").astype(str)
-        df["role"]     = df["role"].fillna("UNKNOWN_ROLE").astype(str)
-        df["user"]     = df["user"].fillna("UNKNOWN_USER").astype(str)
-        df["pc"]       = df["pc"].fillna("UNKNOWN_PC").astype(str)
+        # --- 2) ensure an 'activity' column exists ---
+        if "activity" not in df.columns:
+            logger.info("No 'activity' column found – synthesizing from other columns.")
 
-        # Encoders
-        df["activity_encoded"] = LabelEncoder().fit_transform(df["activity"])
-        df["role_encoded"]     = LabelEncoder().fit_transform(df["role"])
+            # Columns we don't want in the activity text
+            core_cols = {"date", config.DATE_COLUMN, "user", "pc", "role", "hour", "day_of_week"}
 
-        # Deterministic namespaced IDs
-        user_keys = [f"user:{u}" for u in df["user"]]
-        pc_keys   = [f"pc:{p}"   for p in df["pc"]]
+            extra_cols = [c for c in df.columns if c not in core_cols]
 
-        unique_nodes = sorted(set(user_keys + pc_keys))
-        node_map = {node: i for i, node in enumerate(unique_nodes)}
+            if extra_cols:
+                # Build text like: "logon_count=10 | device=3 | http=15"
+                df["activity"] = (
+                    df[extra_cols]
+                    .astype(str)
+                    .apply(
+                        lambda row: " | ".join(
+                            f"{col}={val}" for col, val in zip(extra_cols, row)
+                        ),
+                        axis=1,
+                    )
+                )
+            else:
+                df["activity"] = "unknown"
 
-        df["user_id"] = [node_map[k] for k in user_keys]
-        df["pc_id"]   = [node_map[k] for k in pc_keys]
+        # --- 3) ensure optional columns exist ---
+        if "pc" not in df.columns:
+            df["pc"] = "unknown"
+        if "role" not in df.columns:
+            df["role"] = "unknown"
 
-        logger.info(f"Preprocessing complete: {len(df)} events")
+        # --- 4) Label encoders ---
+        activity_enc = LabelEncoder()
+        role_enc = LabelEncoder()
+
+        df["activity_encoded"] = activity_enc.fit_transform(df["activity"].astype(str))
+        df["role_encoded"] = role_enc.fit_transform(df["role"].astype(str))
+
+        # --- 5) Map users + PCs to integer node ids ---
+        users = df["user"].astype(str).tolist()
+        pcs = df["pc"].astype(str).tolist()
+        unique_nodes = set(users + pcs)
+        node_mapping = {node: i for i, node in enumerate(unique_nodes)}
+        df["user_id"] = df["user"].map(node_mapping)
+        df["pc_id"] = df["pc"].map(node_mapping)
+
+        logger.info(
+            f"Preprocessing complete: {len(df)} events, {len(unique_nodes)} unique nodes"
+        )
         return df
 
-    # ------------------------------------------------------------------
-    # STEP 2 — SLIDING WINDOWS
-    # ------------------------------------------------------------------
     def _process_windows(
-        self, df: pd.DataFrame, window_time: int, slide_time: int, callback
-    ):
-        start = df["date"].min()
-        end   = df["date"].max()
+        self,
+        df: pd.DataFrame,
+        window_time: int,
+        slide_time: int,
+        callback: Optional[Callable[[int, int, Dict], None]] = None,
+    ) -> Dict:
+        """Main sliding window loop."""
+        start_date = df["date"].min()
+        end_date = df["date"].max()
 
-        windows = []
-        cur = start
-        while cur <= end:
-            windows.append(cur)
-            cur += pd.Timedelta(minutes=slide_time)
+        logger.info(
+            f"Windowing from {start_date} to {end_date} "
+            f"(window={window_time}min, slide={slide_time}min)"
+        )
 
-        logger.info(f"Number of windows: {len(windows)}")
+        # Precompute window start times
+        window_starts: List[pd.Timestamp] = []
+        current = start_date
+        while current <= end_date:
+            window_starts.append(current)
+            current += pd.Timedelta(minutes=slide_time)
 
-        all_records = []
-        all_metrics = []
+        total_windows = len(window_starts)
+        logger.info(f"Total windows to process: {total_windows}")
 
-        for idx, win_start in enumerate(windows):
+        all_records: List[Dict] = []
+        window_metrics: List[Dict] = []
+
+        for idx, win_start in enumerate(window_starts):
             win_end = win_start + pd.Timedelta(minutes=window_time)
-            wdf = df[(df["date"] >= win_start) & (df["date"] < win_end)]
+            window_df = df[(df["date"] >= win_start) & (df["date"] < win_end)].copy()
 
-            if len(wdf) < config.MIN_EVENTS_PER_WINDOW:
+            if len(window_df) < config.MIN_EVENTS_PER_WINDOW:
+                logger.debug(
+                    f"Skipping window {idx} @ {win_start} (only {len(window_df)} events)"
+                )
                 continue
 
             try:
-                out = self._process_window(wdf.copy(), win_start, idx)
+                res = self._process_single_window(
+                    window_df=window_df,
+                    win_start=win_start,
+                    win_index=idx,
+                )
             except Exception as e:
                 logger.error(f"Error in window {idx}: {e}")
                 continue
 
-            all_records.extend(out["records"])
-            all_metrics.append(out["metrics"])
+            all_records.extend(res["records"])
+            window_metrics.append(res["metrics"])
 
-            if callback:
-                callback(idx, len(windows), out["metrics"])
+            # Callback for UI (Streamlit)
+            if callback is not None:
+                info = {
+                    "timestamp": win_start,
+                    "events": res["metrics"]["n_events"],
+                    "anomalies": res["metrics"]["n_anomalies"],
+                    "avg_exit": None,  # reserved for early-exit variants
+                }
+                callback(idx, total_windows, info)
+
+        anomalies_df = pd.DataFrame(all_records)
+        metrics_df = pd.DataFrame(window_metrics)
+
+        logger.info(f"Processed {total_windows} windows")
+        logger.info(f"Total records analyzed: {len(df)}")
+        logger.info(f"Total anomalies detected: {len(anomalies_df)}")
 
         return {
-            "anomalies_df": pd.DataFrame(all_records),
-            "metrics_df": pd.DataFrame(all_metrics),
+            "anomalies_df": anomalies_df,
+            "metrics_df": metrics_df,
+            "n_windows": total_windows,
         }
 
-    # ------------------------------------------------------------------
-    # STEP 3 — PROCESS ONE WINDOW
-    # ------------------------------------------------------------------
-    def _process_window(self, window_df, win_start, win_idx):
+    def _process_single_window(
+        self,
+        window_df: pd.DataFrame,
+        win_start: pd.Timestamp,
+        win_index: int,
+    ) -> Dict:
+        """Process one time window: embeddings → anomaly detection."""
         t0 = time.time()
+        window_df = window_df.copy().reset_index(drop=True)  # IMPORTANT: reset index!
 
-        # Build texts
-        texts = [render_event(r) for _, r in window_df.iterrows()]
+        # 1) Build texts
+        texts = [render_event(row) for _, row in window_df.iterrows()]
 
-        # Embeddings
+        # 2) TinyLlama embeddings (last token)
         embeddings = self.model.get_embeddings(texts, layer=-1, pooling="last")
-
-        # NLL losses
+        # Optional: NLL (not required for anomaly features)
         nll_scores = self.model.compute_nll(texts)
+
+        # Attach basic stats to rows (as lists, because numpy arrays)
+        window_df["embedding"] = list(embeddings)
         window_df["llm_nll"] = nll_scores
 
-        # EMA user embeddings
-        user_embs = {}
-        alpha = 0.3
-
+        # 3) Aggregate embeddings per user_id
+        node_embs: Dict[int, np.ndarray] = {}
         for i, row in window_df.iterrows():
             uid = row["user_id"]
             emb = embeddings[i]
-            if uid not in user_embs:
-                user_embs[uid] = emb.copy()
-            else:
-                user_embs[uid] = alpha * emb + (1 - alpha) * user_embs[uid]
+            node_embs.setdefault(uid, []).append(emb)
 
-        zero = np.zeros(self.hidden_size, dtype=np.float32)
+        for uid, emb_list in node_embs.items():
+            node_embs[uid] = np.mean(np.vstack(emb_list), axis=0)
 
-        # Build features
-        features = []
+        zero_vec = np.zeros(self.hidden_size, dtype=np.float32)
+
+        # 4) Build edge features: [user_emb, pc_emb, activity_encoded]
+        edge_features: List[np.ndarray] = []
         for i, row in window_df.iterrows():
-            uemb = user_embs.get(row["user_id"], zero)
-            pemb = user_embs.get(row["pc_id"], zero)
+            user_emb = node_embs.get(row["user_id"], zero_vec)
+            pc_emb = node_embs.get(row["pc_id"], zero_vec)
+            activity_feat = np.array([row["activity_encoded"]], dtype=np.float32)
+            feat = np.concatenate([user_emb, pc_emb, activity_feat], axis=0)
+            edge_features.append(feat)
 
-            extra = np.array([
-                row["hour"],
-                row["day_of_week"],
-                row["activity_encoded"],
-                row["role_encoded"],
-                row["llm_nll"],
-            ], dtype=np.float32)
+        X = np.vstack(edge_features)
 
-            features.append(np.concatenate([uemb, pemb, extra]))
-
-        X = np.vstack(features)
-
-        # Rolling baseline anomaly detection
-        if len(self.baseline_features) >= config.MIN_BASELINE_SAMPLES:
-            baseline = np.vstack(self.baseline_features)
-            self.detector.fit(baseline)
-            scores, labels = self.detector.predict(X)
-        else:
-            self.detector.fit(X)
-            scores, labels = self.detector.predict(X)
-
+        # 5) Anomaly detection
+        self.detector.fit(X)
+        scores, labels = self.detector.predict(X)
         threshold = self.detector.get_threshold(scores, config.ANOMALY_QUANTILE)
 
-        # Update rolling baseline
-        self.baseline_features.extend([x for x in X])
-        if len(self.baseline_features) > config.BASELINE_MAX_EVENTS:
-            self.baseline_features = self.baseline_features[-config.BASELINE_MAX_EVENTS:]
-
-        # SAFE INDEX LOOP (fix for "index out of bounds")
-        n = min(len(window_df), len(scores))
-        records = []
-
-        for i in range(n):
-            r = window_df.iloc[i]
-            records.append({
-                "window_index": win_idx,
+        # 6) Build per-event records
+        records: List[Dict] = []
+        for i, (_, row) in enumerate(window_df.iterrows()):
+            rec = {
+                "window_index": win_index,
                 "window_start": win_start,
-                "date": r["date"],
-                "user": r["user"],
-                "pc": r["pc"],
-                "activity": r["activity"],
+                "date": row["date"],
+                "user": row["user"],
+                "user_id": row["user_id"],
+                "pc": row["pc"],
+                "pc_id": row["pc_id"],
+                "activity": row["activity"],
+                "activity_encoded": row["activity_encoded"],
                 "score": float(scores[i]),
-                "is_anomaly": int(scores[i] > threshold),
-                "nll": float(r["llm_nll"]),
-            })
+                "is_anomaly_if": int(labels[i]),               # IsolationForest label
+                "is_anomaly_thr": int(scores[i] > threshold),  # quantile label
+                "llm_nll": float(nll_scores[i]),
+            }
+            records.append(rec)
 
-        n_an = sum(r["is_anomaly"] for r in records)
+        n_anomalies = int(sum(r["is_anomaly_thr"] for r in records))
+        processing_time = time.time() - t0
 
         metrics = {
-            "window_index": win_idx,
+            "window_index": win_index,
             "timestamp": win_start,
             "n_events": len(window_df),
-            "n_anomalies": n_an,
-            "anomaly_rate": n_an / len(window_df),
+            "n_anomalies": n_anomalies,
+            "anomaly_rate": n_anomalies / len(window_df),
+            "processing_time_sec": processing_time,
             "threshold": float(threshold),
         }
 
+        logger.debug(
+            f"Window {win_index}: {len(window_df)} events, "
+            f"{n_anomalies} anomalies, time={processing_time:.2f}s"
+        )
+
         return {"records": records, "metrics": metrics}
 
-    # ------------------------------------------------------------------
-    # SAVE RESULTS
-    # ------------------------------------------------------------------
-    def _save_results(self, results: Dict, output_dir: str):
+    def _save_results(self, results: Dict, output_dir: str) -> None:
+        """Save anomalies, metrics, and a simple score plot."""
         os.makedirs(output_dir, exist_ok=True)
 
-        anomalies = results["anomalies_df"]
-        metrics   = results["metrics_df"]
+        anomalies_df: pd.DataFrame = results["anomalies_df"]
+        metrics_df: pd.DataFrame = results["metrics_df"]
 
-        anomalies.to_csv(os.path.join(output_dir, "anomalies.csv"), index=False)
-        metrics.to_csv(os.path.join(output_dir, "metrics.csv"), index=False)
+        anomalies_path = os.path.join(output_dir, "anomalies.csv")
+        metrics_path = os.path.join(output_dir, "metrics.csv")
 
-        if not anomalies.empty:
+        anomalies_df.to_csv(anomalies_path, index=False)
+        metrics_df.to_csv(metrics_path, index=False)
+
+        logger.info(f"Saved anomalies → {anomalies_path}")
+        logger.info(f"Saved metrics   → {metrics_path}")
+
+        # Simple score histogram
+        if not anomalies_df.empty:
             plt.figure(figsize=(8, 5))
-            anomalies["score"].hist(bins=40, edgecolor="black")
-            plt.xlabel("Anomaly Score")
+            anomalies_df["score"].hist(
+                bins=config.SCORE_HISTOGRAM_BINS,
+                edgecolor="black",
+            )
+            plt.xlabel("Anomaly score")
             plt.ylabel("Count")
             plt.title("Anomaly Score Distribution")
             plt.tight_layout()
-            plt.savefig(os.path.join(output_dir, "score_distribution.png"), dpi=120)
+
+            plot_path = os.path.join(output_dir, "score_distribution.png")
+            plt.savefig(plot_path, dpi=config.PLOT_DPI)
             plt.close()
+
+            logger.info(f"Saved score distribution plot → {plot_path}")
 
 
 # ----------------------------------------------------------------------
-# Streamlit wrapper
+# Convenience function used by Streamlit app
 # ----------------------------------------------------------------------
 def run_realtime_detection(
     file_path: str,
@@ -325,9 +431,14 @@ def run_realtime_detection(
     test_mode: bool = True,
     window_time: int = 60,
     slide_time: int = 10,
-    status_callback=None,
+    status_callback: Optional[Callable[[int, int, Dict], None]] = None,
 ):
+    """
+    Wrapper used by the UI.
 
+    Returns:
+        anomalies_df, output_folder
+    """
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     output_folder = os.path.join(output_base_dir, timestamp)
 
@@ -344,8 +455,8 @@ def run_realtime_detection(
     return results["anomalies_df"], output_folder
 
 
-# Manual test
 if __name__ == "__main__":
+    # Simple manual test (you can run: python pipeline_rt.py path\to\data.csv)
     import sys
 
     if len(sys.argv) < 2:
@@ -355,6 +466,7 @@ if __name__ == "__main__":
     csv_path = sys.argv[1]
     out_dir = os.path.join(config.OUTPUT_BASE_DIR, "manual_test")
 
+    print(f"Running pipeline on: {csv_path}")
     anomalies, out_folder = run_realtime_detection(
         file_path=csv_path,
         output_base_dir=out_dir,
@@ -363,8 +475,5 @@ if __name__ == "__main__":
         slide_time=10,
         status_callback=None,
     )
-
-    print("Done.")
-    print(f"Anomalies: {len(anomalies)}")
+    print(f"Done. Anomalies: {len(anomalies)}")
     print(f"Outputs in: {out_folder}")
-
